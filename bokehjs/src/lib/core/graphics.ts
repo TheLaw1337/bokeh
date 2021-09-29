@@ -8,6 +8,8 @@ import {Rect, AffineTransform} from "./util/affine"
 import {color2css} from "./util/color"
 import {CanvasImage} from "models/glyphs/image_url"
 import * as visuals from "./visuals"
+import { Text, Line, Fill } from "./property_mixins"
+import { ValuesOf } from "./visuals/visual"
 
 
 export const text_width: (text: string, font: string) => number = (() => {
@@ -43,7 +45,7 @@ export type ImageProperties = {
 }
 export abstract class GraphicsBox {
   _position: Position = {sx: 0, sy: 0}
-  angle?: number
+  _angle: number
   width?: {value: number, unit: "%"}
   height?: {value: number, unit: "%"}
   padding?: Padding
@@ -55,6 +57,15 @@ export abstract class GraphicsBox {
 
   _x_anchor: "left" | "center" | "right" = "left"
   _y_anchor: "top"  | "center" | "baseline" | "bottom" = "center"
+
+  set angle(v: number | undefined) {
+    if (v != undefined)
+      this._angle = v
+  }
+
+  get angle(): number {
+    return this._angle
+  }
 
   set base_font_size(v: number | null | undefined) {
     if (v != null)
@@ -600,6 +611,7 @@ export class ImageTextBox extends TextBox {
     ctx.restore()
   }
 }
+
 export class BaseExpo extends GraphicsBox {
   constructor(readonly base: GraphicsBox, readonly expo: GraphicsBox) {
     super()
@@ -780,5 +792,169 @@ export class GraphicsBoxes {
       height = Math.max(height, size.height)
     }
     return {width, height}
+  }
+}
+
+export class GraphicsContainer extends GraphicsBox {
+  constructor(readonly items: GraphicsBox[]) {
+    super()
+  }
+
+  override set base_font_size(v: number | null | undefined) {
+    if (v != null)
+      this._base_font_size = v
+
+    for (const item of this.items) {
+      item.base_font_size = v
+    }
+  }
+
+  override get base_font_size(): number {
+    return this._base_font_size
+  }
+
+  set visuals(v: visuals.Text["Values"] | visuals.Line["Values"] | visuals.Fill["Values"]) {
+    for (const item of this.items) {
+      item.visuals = v
+    }
+
+    const metric_map = {x: 0, cap: 1, ascent: 2, x_descent: 3, cap_descent: 4, ascent_descent: 5}
+    const common = max_by(this.items.map((item) => item.infer_text_height()), (metric) => metric_map[metric])
+
+    for (const item of this.items) {
+      item.text_height_metric = common
+    }
+  }
+
+  override set angle(a: number) {
+    this._angle = a
+    for (const item of this.items) {
+      item.angle = a
+    }
+  }
+
+  override get angle(): number {
+    return this._angle
+  }
+
+  override _size(): Size {
+    let width = 0
+    let height = 0
+
+    for (const item of this.items) {
+      const size = item.size()
+      width += size.width
+      height = Math.max(height, size.height)
+    }
+
+    return {width, height}
+  }
+
+  _rect(): Rect {
+    const {width, height} = this._size()
+
+    const {x, y} = this._computed_position({width, height})
+
+    const bbox = new BBox({x, y, width, height})
+    return bbox.rect
+  }
+
+  override infer_text_height(): TextHeightMetric {
+    for (const item of this.items)
+      if (item instanceof TextBox)
+        return item.infer_text_height()
+
+    return "ascent_descent"
+  }
+
+  override get position(): Position {
+    return this._position
+  }
+
+  override set position(pos: Position) {
+    this._position = {...pos}
+    const {x} = this._computed_position(this._size())
+    this.compute_items_positions({...pos, sx: x})
+  }
+
+  _computed_position(size: Size) : {x: number, y: number} {
+    const {sx, x_anchor=this._x_anchor, sy, y_anchor=this._y_anchor} = this.position
+    const {width, height} = size
+
+    const x = sx - (() => {
+      if (isNumber(x_anchor))
+        return x_anchor*width
+      else {
+        switch (x_anchor) {
+          case "left": return 0
+          case "center": return 0.5*width
+          case "right": return width
+        }
+      }
+    })()
+
+    const y = sy - (() => {
+      if (isNumber(y_anchor))
+        return y_anchor*height
+      else {
+        switch (y_anchor) {
+          case "top": return 0
+          case "center": return 0.5*height
+          case "bottom": return height
+          case "baseline": return 0.5*height
+        }
+      }
+    })()
+
+    return {x, y}
+  }
+
+  private compute_items_positions(pos: Position, n?: number): void {
+    if (typeof n === "undefined")
+      n = 0
+
+    const in_bounds = (i: number) => i < this.items.length && i >= 0
+    const previous_index = n-1
+    const next_index = n+1
+    const {sx, sy, y_anchor="center"} = pos
+    const {height: container_height} = this._size()
+    const {height: item_height} = this.items[n].size()
+
+    let item_sy = sy - (() => {
+      if (isNumber(y_anchor))
+        return y_anchor*item_height
+      else {
+        switch (y_anchor) {
+          case "top": return item_height-container_height
+          case "center": return 0
+          case "bottom": return 0
+          case "baseline": return 0
+        }
+      }
+    })()
+
+    // first item
+    if (!in_bounds(previous_index)) {
+      this.items[n].position = {...pos, sy: item_sy, x_anchor: "left", y_anchor}
+      if (in_bounds(next_index)) return this.compute_items_positions({...pos}, next_index)
+      return
+    }
+
+    const {width} = this.items[previous_index].size()
+    pos.sx = sx + width
+
+    this.items[n].position = {...pos, sy: item_sy, x_anchor: "left", y_anchor}
+
+    if (!in_bounds(next_index)) {
+      return
+    }
+
+    return this.compute_items_positions({...pos}, next_index)
+  }
+
+  override paint(ctx: Context2d): void {
+    for (const item of this.items) {
+      item.paint(ctx)
+    }
   }
 }
