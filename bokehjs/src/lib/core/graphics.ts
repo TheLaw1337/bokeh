@@ -3,14 +3,11 @@ import {BBox} from "./util/bbox"
 import {Context2d} from "./util/canvas"
 import {font_metrics, /*glyph_metrics,*/ FontMetrics, parse_css_font_size} from "./util/text"
 import {max, max_by, sum} from "./util/array"
-import {isNumber} from "./util/types"
+import {isNumber, isObject} from "./util/types"
 import {Rect, AffineTransform} from "./util/affine"
 import {color2css} from "./util/color"
 import {CanvasImage} from "models/glyphs/image_url"
 import * as visuals from "./visuals"
-import { Text, Line, Fill } from "./property_mixins"
-import { ValuesOf } from "./visuals/visual"
-
 
 export const text_width: (text: string, font: string) => number = (() => {
   const canvas = document.createElement("canvas")
@@ -500,11 +497,13 @@ export class TextBox extends GraphicsBox {
  * A Image display that behaves like a TextBox.
  */
 export class ImageTextBox extends TextBox {
-  image: CanvasImage
+  image: CanvasImage | null = null
   image_properties: ImageProperties
-  load_image: () => Promise<void>
+  load_image: (image_box: ImageTextBox) => Promise<void>
 
-  constructor({text, load_image}: {text: string, load_image: () => Promise<void>}) {
+  constructor({text, load_image}: {
+    text: string,
+    load_image: (image_box: ImageTextBox) => Promise<void>}) {
     super({text})
     this.load_image = load_image
   }
@@ -538,15 +537,13 @@ export class ImageTextBox extends TextBox {
         switch (y_anchor) {
           case "top":
             if (metrics.height > height)
-              return (height - (-v_align - metrics.descent) - metrics.height)
+              return height - metrics.height + v_align
             else
               return 0
           case "center": return 0.5*height
           case "bottom":
             if (metrics.height > height)
-              return (
-                height + metrics.descent + v_align
-              )
+              return height + v_align
             else return height
           case "baseline": return 0.5*height
         }
@@ -556,43 +553,26 @@ export class ImageTextBox extends TextBox {
     return {x, y}
   }
 
-  override size(): Size {
-    if (!this.image) return {width: 0, height: 0}
+  override _size(): Size & {metrics: FontMetrics} {
+    if (!this.image) return {width: 0, height: 0, metrics: font_metrics(this.font)}
 
-    let {width, height} = this._size()
-    const {angle} = this
+    let {width, height} = this.image_properties
+
     const metrics = font_metrics(this.font)
 
     if (height < metrics.height) {
       height = metrics.height
     }
 
-    if (!angle)
-      return {width, height}
-    else {
-      const c = Math.cos(Math.abs(angle))
-      const s = Math.sin(Math.abs(angle))
-
-      return {
-        width: Math.abs(width*c + height*s),
-        height: Math.abs(width*s + height*c),
-      }
-    }
-  }
-
-  override _size(): Size & {metrics: FontMetrics} {
-    if (!this.image) return {width: 0, height: 0, metrics: font_metrics(this.font)}
-
-    const {width, height} = this.image_properties
     const w_scale = this.width?.unit == "%" ? this.width.value : 1
     const h_scale = this.height?.unit == "%" ? this.height.value : 1
 
-    return {width: width*w_scale, height: height*h_scale, metrics: font_metrics(this.font)}
+    return {width: width*w_scale, height: height*h_scale, metrics}
   }
 
   override paint(ctx: Context2d): void {
     if (!this.image) {
-      this.load_image()
+      this.load_image(this)
       return
     }
 
@@ -795,6 +775,10 @@ export class GraphicsBoxes {
   }
 }
 
+export function is_image_box(item: unknown): item is ImageTextBox {
+  return isObject(item) && typeof (item as ImageTextBox).image != "undefined"
+}
+
 export class GraphicsContainer extends GraphicsBox {
   constructor(readonly items: GraphicsBox[]) {
     super()
@@ -837,12 +821,36 @@ export class GraphicsContainer extends GraphicsBox {
     return this._angle
   }
 
+  private get max_v_align(): number {
+    let max_value = 0
+
+    const values = this.items
+      .filter(is_image_box)
+      .map(item => item.image_properties?.v_align ?? 0)
+
+    values.map(Math.abs)
+      .reduce((max, value, index) => {
+        if (value > max) {
+          max_value = values[index]
+          return value
+        }
+        return max
+      }, 0)
+
+    return max_value
+  }
+
+  get v_aligns(): number[] {
+    return this.items
+      .map(item => is_image_box(item) ? item.image_properties?.v_align ?? 0 : 0)
+  }
+
   override _size(): Size {
     let width = 0
     let height = 0
 
     for (const item of this.items) {
-      const size = item.size()
+      const size = item._size()
       width += size.width
       height = Math.max(height, size.height)
     }
@@ -853,17 +861,13 @@ export class GraphicsContainer extends GraphicsBox {
   _rect(): Rect {
     const {width, height} = this._size()
 
-    const {x, y} = this._computed_position({width, height})
+    const {x, y} = this._computed_position()
 
     const bbox = new BBox({x, y, width, height})
     return bbox.rect
   }
 
   override infer_text_height(): TextHeightMetric {
-    for (const item of this.items)
-      if (item instanceof TextBox)
-        return item.infer_text_height()
-
     return "ascent_descent"
   }
 
@@ -873,13 +877,13 @@ export class GraphicsContainer extends GraphicsBox {
 
   override set position(pos: Position) {
     this._position = {...pos}
-    const {x} = this._computed_position(this._size())
+    const {x} = this._computed_position()
     this.compute_items_positions({...pos, sx: x})
   }
 
-  _computed_position(size: Size) : {x: number, y: number} {
+  _computed_position() : {x: number, y: number} {
     const {sx, x_anchor=this._x_anchor, sy, y_anchor=this._y_anchor} = this.position
-    const {width, height} = size
+    const {width, height} = this._size()
 
     const x = sx - (() => {
       if (isNumber(x_anchor))
@@ -918,32 +922,27 @@ export class GraphicsContainer extends GraphicsBox {
     const next_index = n+1
     const {sx, sy, y_anchor="center"} = pos
     const {height: container_height} = this._size()
-    const {height: item_height} = this.items[n].size()
+    const {height: item_height, width: item_width} = this.items[n]._size()
 
-    let item_sy = sy - (() => {
-      if (isNumber(y_anchor))
-        return y_anchor*item_height
-      else {
-        switch (y_anchor) {
-          case "top": return item_height-container_height
-          case "center": return 0
-          case "bottom": return 0
-          case "baseline": return 0
-        }
-      }
-    })()
+    // TODO: this only works for top and bottom
+    const container_space = y_anchor == "top" ? item_height-container_height : 0
+    // const item_sy = sy - container_space + (this.max_v_align - this.v_aligns[n])
+    const item_sy = sy - container_space
 
     // first item
     if (!in_bounds(previous_index)) {
+      this.items[n].position = {...this.position, sx: this.position.sx - item_width}
       this.items[n].position = {...pos, sy: item_sy, x_anchor: "left", y_anchor}
+
       if (in_bounds(next_index)) return this.compute_items_positions({...pos}, next_index)
       return
     }
 
-    const {width} = this.items[previous_index].size()
+    const {width} = this.items[previous_index]._size()
     pos.sx = sx + width
 
     this.items[n].position = {...pos, sy: item_sy, x_anchor: "left", y_anchor}
+    // this.items[n].position = {...this.position, sx: this.position.sx + width}
 
     if (!in_bounds(next_index)) {
       return
